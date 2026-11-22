@@ -49,7 +49,7 @@ cd deadlock-server-blocker-DSB
 *(Run `./uninstall.sh` to remove launchers and desktop entries.)*
 
 ### Windows 10 / 11
-- **Prebuilt `.exe`:** Download `DeadlockServerBlocker-DSB.exe` from **Releases** (or **Actions** artifacts) and run it (accept the UAC prompt).
+- **Prebuilt `.exe`:** Download `DeadlockServerBlocker-DSB.exe` from [**Releases**](https://github.com/Zyd93/deadlock-server-blocker-DSB/releases) (or [**Actions**](https://github.com/Zyd93/deadlock-server-blocker-DSB/actions) artifacts) and run it (accept the UAC prompt).
 - **From source** *(requires Python 3.10+)*:
   ```powershell
   git clone https://github.com/Zyd93/deadlock-server-blocker-DSB.git
