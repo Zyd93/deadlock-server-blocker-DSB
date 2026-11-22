@@ -1,0 +1,22 @@
+#!/bin/bash
+set -u
+
+runtime_dir="/run/user/$(id -u)"
+if [[ ! -d "$runtime_dir" ]]; then
+    runtime_dir="${XDG_RUNTIME_DIR:-/tmp}"
+fi
+
+pass_file="$runtime_dir/dsb-pass-$(id -u)"
+if [[ -f "$pass_file" ]]; then
+    cat "$pass_file"
+    rm -f "$pass_file"
+    exit 0
+fi
+
+if command -v kdialog >/dev/null 2>&1; then
+    exec kdialog --title "Deadlock Server Blocker - DSB" --password "Incorrect sudo password. Please try again:"
+elif command -v zenity >/dev/null 2>&1; then
+    exec zenity --password --title="Deadlock Server Blocker - DSB"
+fi
+
+exit 1

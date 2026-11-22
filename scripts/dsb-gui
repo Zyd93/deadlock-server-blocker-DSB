@@ -1,0 +1,124 @@
+#!/bin/bash
+set -u
+
+SCRIPT_PATH="$(readlink -f "$0")"
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Re-exec inside a private PTY so sudo caches auth only for this app session
+if [[ "${DSB_IN_PTY:-}" != "1" ]]; then
+    export DSB_IN_PTY=1
+    export SHELL=/bin/bash
+    printf -v quoted_script '%q' "$SCRIPT_PATH"
+    exec /usr/bin/script -qec "$quoted_script" /dev/null </dev/null
+fi
+
+prompt_password() {
+    local msg="$1"
+    if command -v kdialog >/dev/null 2>&1; then
+        kdialog --title "Deadlock Server Blocker - DSB" --password "$msg"
+    elif command -v zenity >/dev/null 2>&1; then
+        zenity --password --title="Deadlock Server Blocker - DSB"
+    else
+        return 1
+    fi
+}
+
+show_error() {
+    local msg="$1"
+    if command -v kdialog >/dev/null 2>&1; then
+        kdialog --title "Deadlock Server Blocker - DSB" --sorry "$msg"
+    elif command -v zenity >/dev/null 2>&1; then
+        zenity --error --title="Deadlock Server Blocker - DSB" --no-markup --text="$msg"
+    else
+        printf '%s\n' "$msg" >&2
+    fi
+}
+
+# Check pam_faillock before touching sudo so locked accounts see an exact countdown
+check_faillock() {
+    command -v faillock >/dev/null 2>&1 || return 0
+    local count=0 latest=0 ts now remaining mins secs
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        ts=$(date -d "$line" +%s 2>/dev/null) || continue
+        count=$((count + 1))
+        if (( ts > latest )); then
+            latest=$ts
+        fi
+    done < <(faillock --user "$USER" 2>/dev/null | awk '$NF == "V" && $1 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/ { print $1 " " $2 }')
+
+    now=$(date +%s)
+    if (( count >= 3 && latest > 0 && now - latest < 600 )); then
+        remaining=$((600 - (now - latest)))
+        mins=$((remaining / 60))
+        secs=$((remaining % 60))
+        show_error "Your account is temporarily locked by pam_faillock (3 consecutive failed sudo attempts)."$'\n\n'"Please wait ${mins}m ${secs}s and try again."
+        exit 1
+    fi
+}
+
+if ! command -v kdialog >/dev/null 2>&1 && ! command -v zenity >/dev/null 2>&1; then
+    printf 'Error: neither kdialog nor zenity is installed.\n' >&2
+    exit 1
+fi
+
+check_faillock
+
+# Prompt with GUI dialog first so clicking Cancel never invokes sudo/PAM
+pass=$(prompt_password "Enter your sudo password to manage Deadlock firewall packet rules:") || exit 0
+if [[ -z "$pass" ]]; then
+    exit 0
+fi
+
+runtime_dir="/run/user/$(id -u)"
+if [[ ! -d "$runtime_dir" ]]; then
+    runtime_dir="${XDG_RUNTIME_DIR:-/tmp}"
+fi
+
+pass_file="$runtime_dir/dsb-pass-$(id -u)"
+err_file=$(mktemp "$runtime_dir/dsb-err-$(id -u).XXXXXX")
+keepalive_pid=""
+
+cleanup() {
+    if [[ -n "$keepalive_pid" ]]; then
+        kill "$keepalive_pid" 2>/dev/null || true
+    fi
+    rm -f "$pass_file" "$err_file"
+    /usr/bin/sudo -k 2>/dev/null || true
+}
+trap cleanup EXIT
+
+(
+    umask 077
+    rm -f "$pass_file"
+    printf '%s\n' "$pass" > "$pass_file"
+)
+unset pass
+
+export SUDO_ASKPASS="${SCRIPT_DIR}/dsb-askpass"
+if ! /usr/bin/sudo -A -v 2>"$err_file"; then
+    err_msg=$(cat "$err_file")
+    rm -f "$pass_file" "$err_file"
+    if [[ "$err_msg" == *"no password was provided"* ]]; then
+        exit 0
+    fi
+    show_error "sudo authentication failed, so Deadlock Server Blocker - DSB was not started."$'\n\n'"If you hit 3 failed attempts, pam_faillock locks your account for 10 minutes (check with: faillock --user $USER)."
+    exit 1
+fi
+rm -f "$pass_file" "$err_file"
+
+# Keep the private PTY sudo ticket alive while the DSB window is open
+(
+    sleep_pid=""
+    trap '[[ -n "$sleep_pid" ]] && kill "$sleep_pid" 2>/dev/null; exit 0' TERM INT
+    while kill -0 "$$" 2>/dev/null; do
+        sleep 60 &
+        sleep_pid=$!
+        wait "$sleep_pid" || break
+        /usr/bin/sudo -n -v 2>/dev/null || break
+    done
+) </dev/null >/dev/null 2>&1 &
+keepalive_pid=$!
+
+/usr/bin/python3 "${PROJECT_DIR}/dsb/app.py"
