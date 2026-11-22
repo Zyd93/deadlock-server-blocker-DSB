@@ -1,18 +1,54 @@
-name: Build Windows Executable
+name: CI & Release Builds
 
 on:
-  workflow_dispatch:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
+  pull_request:
   release:
     types: [published]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build-windows:
+  linux-test-and-package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run unit tests, syntax, and shell checks
+        run: |
+          python3 -m py_compile dsb/*.py
+          python3 -m unittest discover -s tests -v
+          bash -n scripts/dsb-gui scripts/dsb-askpass install.sh uninstall.sh
+
+      - name: Package Linux release archive
+        run: |
+          tar -czf DeadlockServerBlocker-DSB-linux.tar.gz \
+            dsb ui assets scripts install.sh uninstall.sh README.md LICENSE SECURITY.md
+
+      - name: Upload Linux archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeadlockServerBlocker-DSB-linux
+          path: DeadlockServerBlocker-DSB-linux.tar.gz
+
+      - name: Attach Linux archive to GitHub Release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" DeadlockServerBlocker-DSB-linux.tar.gz --clobber
+
+  windows-test-and-build:
     runs-on: windows-latest
     steps:
       - name: Checkout repository
@@ -39,6 +75,7 @@ jobs:
             --onefile `
             --noconsole `
             --uac-admin `
+            --paths "." `
             --icon "assets/icon.ico" `
             --name "DeadlockServerBlocker-DSB" `
             --add-data "ui;ui" `
@@ -52,8 +89,9 @@ jobs:
           name: DeadlockServerBlocker-DSB-win64
           path: dist/DeadlockServerBlocker-DSB.exe
 
-      - name: Attach executable to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/DeadlockServerBlocker-DSB.exe
+      - name: Attach Windows executable to GitHub Release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" dist/DeadlockServerBlocker-DSB.exe --clobber

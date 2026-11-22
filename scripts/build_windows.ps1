@@ -14,6 +14,7 @@ try {
         --onefile `
         --noconsole `
         --uac-admin `
+        --paths "." `
         --icon "assets/icon.ico" `
         --name "DeadlockServerBlocker-DSB" `
         --add-data "ui;ui" `
