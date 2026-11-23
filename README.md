@@ -26,7 +26,7 @@ A lightweight desktop app for **Linux** and **Windows 10/11** that lets you pick
 ## Features
 
 - **Interactive tile UI:** Popped-out white-halo tiles are **ON**; dimmed recessed tiles with red `BLOCKED` are blocked.
-- **Live telemetry:** Real-time ping (`ms`) and packet loss (`%`) per region.
+- **Live telemetry:** Real-time ping (`ms`) and packet loss (`%`) per region via UDP SDR probing with ICMP fallback (works cleanly through VPN/TUN proxies like NekoRay/sing-box).
 - **Fast filtering:** Region dropdown (`Europe (EU)`, `North America`, `South America`, `Asia`, `Middle East`, `Oceania`, `Africa`, `All Regions`), search, Cluster toggle, Name/Ping sort, and saved Presets.
 - **Safe one-click reset:** Removes only DSB's firewall rules cleanly.
 

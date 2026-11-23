@@ -12,6 +12,7 @@ from typing import Any
 from dsb.config import get_config_dir
 
 DEADLOCK_APP_ID = 1422450
+DEFAULT_SDR_PORT = 27015
 SDR_URL = f"https://api.steampowered.com/ISteamApps/GetSDRConfig/v1/?appid={DEADLOCK_APP_ID}"
 CLUSTER_KEYWORDS = ("China", "Hong Kong", "Sweden", "India", "Netherlands")
 
@@ -80,10 +81,25 @@ def _parse_description(desc: str, pop_id: str) -> tuple[str, str]:
     return cleaned, pop_id.upper()
 
 
-def _extract_valid_ips(relays: list[Any]) -> list[str]:
-    """Return unique valid IPv4 strings from a PoP relay list preserving order."""
+def _parse_relay_port(port_range: Any) -> int:
+    """Return the starting UDP port from a relay port_range or DEFAULT_SDR_PORT."""
+    if isinstance(port_range, list) and port_range:
+        raw_port = port_range[0]
+        if not isinstance(raw_port, bool):
+            try:
+                port = int(raw_port)
+                if 1 <= port <= 65535:
+                    return port
+            except (TypeError, ValueError):
+                pass
+    return DEFAULT_SDR_PORT
+
+
+def _extract_valid_relays(relays: list[Any]) -> tuple[list[str], dict[str, int]]:
+    """Return unique valid IPv4 strings and first-seen UDP ports from a PoP relay list."""
     seen: set[str] = set()
     ips: list[str] = []
+    relay_ports: dict[str, int] = {}
     for relay in relays:
         if not isinstance(relay, dict):
             continue
@@ -97,6 +113,13 @@ def _extract_valid_ips(relays: list[Any]) -> list[str]:
         if ip not in seen:
             seen.add(ip)
             ips.append(ip)
+            relay_ports[ip] = _parse_relay_port(relay.get("port_range"))
+    return ips, relay_ports
+
+
+def _extract_valid_ips(relays: list[Any]) -> list[str]:
+    """Return unique valid IPv4 strings from a PoP relay list preserving order."""
+    ips, _ = _extract_valid_relays(relays)
     return ips
 
 
@@ -118,7 +141,7 @@ def parse_sdr_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(relays, list) or not relays:
             continue
 
-        ips = _extract_valid_ips(relays)
+        ips, relay_ports = _extract_valid_relays(relays)
         if not ips:
             continue
 
@@ -132,6 +155,7 @@ def parse_sdr_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "group": classify_region(str(pop_id), full_desc),
             "full_desc": full_desc,
             "ips": ips,
+            "relay_ports": relay_ports,
             "member_ids": [str(pop_id)],
         }
         unclustered.append(server_entry)
@@ -148,6 +172,7 @@ def parse_sdr_payload(payload: dict[str, Any]) -> dict[str, Any]:
                     "group": classify_region("", matched_kw),
                     "full_desc": f"{matched_kw} (Cluster)",
                     "ips": [],
+                    "relay_ports": {},
                     "member_ids": [],
                 }
                 clustered_map[cluster_id] = cluster_entry
@@ -158,6 +183,7 @@ def parse_sdr_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 if ip not in existing_ips:
                     existing_ips.add(ip)
                     cluster_entry["ips"].append(ip)
+                    cluster_entry["relay_ports"][ip] = relay_ports.get(ip, DEFAULT_SDR_PORT)
             cluster_entry["member_ids"].append(str(pop_id))
         else:
             clustered_list.append(dict(server_entry))

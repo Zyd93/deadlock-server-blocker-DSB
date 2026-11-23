@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import urllib.request
 from pathlib import Path
@@ -15,6 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from dsb import VERSION  # noqa: E402
 from dsb.app import DSBBackend, start_http_server  # noqa: E402
 from dsb.config import ConfigStore, get_config_dir  # noqa: E402
 from dsb.firewall import (  # noqa: E402
@@ -23,8 +26,15 @@ from dsb.firewall import (  # noqa: E402
     FirewallManager,
     WindowsFirewallManager,
 )
-from dsb.ping import PingManager, parse_ping_output  # noqa: E402
-from dsb.sdr import classify_region, parse_sdr_payload  # noqa: E402
+from dsb.ping import (  # noqa: E402
+    PingManager,
+    is_fake_tun_icmp,
+    parse_ping_output,
+    probe_server,
+    probe_server_udp,
+    probe_udp_relay,
+)
+from dsb.sdr import DEFAULT_SDR_PORT, classify_region, parse_sdr_payload  # noqa: E402
 
 
 class FakeIptables:
@@ -154,14 +164,60 @@ class TestSDR(unittest.TestCase):
         self.assertEqual(fra["name"], "Frankfurt")
         self.assertEqual(fra["region"], "Germany")
         self.assertEqual(fra["ips"], ["155.133.226.68"])
+        self.assertEqual(fra["relay_ports"], {"155.133.226.68": DEFAULT_SDR_PORT})
 
         clustered_ids = [s["id"] for s in parsed["clustered"]]
         self.assertEqual(clustered_ids, ["fra", "cluster:sweden"])
         sweden = parsed["clustered"][1]
         self.assertEqual(sweden["ips"], ["155.133.252.37", "155.133.252.38"])
+        self.assertEqual(
+            sweden["relay_ports"],
+            {"155.133.252.37": DEFAULT_SDR_PORT, "155.133.252.38": DEFAULT_SDR_PORT},
+        )
         self.assertEqual(sorted(sweden["member_ids"]), ["sto", "sto2"])
         self.assertEqual(fra["group"], "Europe")
         self.assertEqual(sweden["group"], "Europe")
+
+    def test_parse_sdr_payload_relay_ports_and_cluster_merge(self) -> None:
+        sample = {
+            "revision": 777,
+            "pops": {
+                "ams": {
+                    "desc": "Amsterdam (Netherlands)",
+                    "relays": [
+                        {"ipv4": "155.133.248.36", "port_range": [27020, 27060]},
+                        {"ipv4": "155.133.248.36", "port_range": [27099, 27100]},
+                        {"ipv4": "155.133.248.37", "port_range": ["bad", 27060]},
+                        {"ipv4": "155.133.248.38", "port_range": [True, 27060]},
+                        {"ipv4": "155.133.248.39", "port_range": [70000, 70010]},
+                    ],
+                },
+                "sto": {
+                    "desc": "Stockholm - Kista (Sweden)",
+                    "relays": [{"ipv4": "162.254.198.42", "port_range": [27025, 27060]}],
+                },
+                "sto2": {
+                    "desc": "Stockholm - Bromma (Sweden)",
+                    "relays": [{"ipv4": "155.133.252.37"}],
+                },
+            },
+        }
+        parsed = parse_sdr_payload(sample)
+        ams = next(s for s in parsed["unclustered"] if s["id"] == "ams")
+        self.assertEqual(
+            ams["relay_ports"],
+            {
+                "155.133.248.36": 27020,
+                "155.133.248.37": DEFAULT_SDR_PORT,
+                "155.133.248.38": DEFAULT_SDR_PORT,
+                "155.133.248.39": DEFAULT_SDR_PORT,
+            },
+        )
+        sweden = next(s for s in parsed["clustered"] if s["id"] == "cluster:sweden")
+        self.assertEqual(
+            sweden["relay_ports"],
+            {"162.254.198.42": 27025, "155.133.252.37": DEFAULT_SDR_PORT},
+        )
 
     def test_classify_region_all_continents(self) -> None:
         cases = [
@@ -364,6 +420,272 @@ class TestPingAndConfig(unittest.TestCase):
         win_drop = "    Packets: Sent = 4, Received = 0, Lost = 4 (100% loss),\n"
         self.assertEqual(parse_ping_output(win_drop), (None, 100))
 
+    def test_is_fake_tun_icmp(self) -> None:
+        linux_fake = (
+            "2 packets transmitted, 2 received, 0% packet loss, time 1001ms\n"
+            "rtt min/avg/max/mdev = 0.063/0.846/1.630/0.783 ms\n"
+        )
+        self.assertTrue(is_fake_tun_icmp(linux_fake))
+
+        win_fake = (
+            "Packets: Sent = 2, Received = 2, Lost = 0 (0% loss),\n"
+            "    Minimum = 0ms, Maximum = 1ms, Average = 0ms\n"
+        )
+        self.assertTrue(is_fake_tun_icmp(win_fake))
+
+        all_sub1ms = (
+            "Reply from 155.133.226.68: bytes=32 time<1ms TTL=64\n"
+            "Reply from 155.133.226.68: bytes=32 time=0ms TTL=64\n"
+        )
+        self.assertTrue(is_fake_tun_icmp(all_sub1ms))
+
+        linux_real = (
+            "2 packets transmitted, 2 received, 0% packet loss, time 200ms\n"
+            "rtt min/avg/max/mdev = 25.612/26.100/27.011/0.511 ms\n"
+        )
+        self.assertFalse(is_fake_tun_icmp(linux_real))
+
+        win_real = (
+            "Reply from 155.133.226.68: bytes=32 time=25ms TTL=53\n"
+            "    Minimum = 25ms, Maximum = 26ms, Average = 25ms\n"
+        )
+        self.assertFalse(is_fake_tun_icmp(win_real))
+
+        win_de_mixed = (
+            "Antwort von 155.133.226.68: Bytes=32 Zeit=42ms TTL=53\n"
+            "Antwort von 155.133.226.68: Bytes=32 Zeit<1ms TTL=53\n"
+        )
+        self.assertFalse(is_fake_tun_icmp(win_de_mixed))
+
+    def test_probe_udp_relay_cases(self) -> None:
+        class FakeClock:
+            def __init__(self) -> None:
+                self.now = 100.0
+
+            def __call__(self) -> float:
+                return self.now
+
+            def advance(self, seconds: float) -> None:
+                self.now += seconds
+
+        class FakeUdpSocket:
+            def __init__(self, outcomes: list[float | None], clock: FakeClock, target_ip: str):
+                self._outcomes = list(outcomes)
+                self._clock = clock
+                self._target_ip = target_ip
+                self._idx = 0
+                self.sent_calls: list[tuple[bytes, tuple[str, int]]] = []
+                self.timeouts: list[float] = []
+                self.closed = False
+
+            def settimeout(self, value: float) -> None:
+                self.timeouts.append(value)
+
+            def sendto(self, data: bytes, addr: tuple[str, int]) -> int:
+                self.sent_calls.append((data, addr))
+                return len(data)
+
+            def recvfrom(self, _bufsize: int) -> tuple[bytes, tuple[str, int]]:
+                outcome = self._outcomes[self._idx]
+                self._idx += 1
+                if outcome is None:
+                    raise socket.timeout("timed out")
+                self._clock.advance(outcome / 1000.0)
+                return b"\x08\x08\x01\x12\x17Invalid/unknown MsgID 0", (
+                    self._target_ip,
+                    self.sent_calls[-1][1][1],
+                )
+
+            def close(self) -> None:
+                self.closed = True
+
+        def run_case(outcomes: list[float | None]) -> tuple[list[float], int, FakeUdpSocket]:
+            clock = FakeClock()
+            created: list[FakeUdpSocket] = []
+
+            def factory(_family: int, _kind: int) -> FakeUdpSocket:
+                sock = FakeUdpSocket(outcomes, clock, "155.133.226.68")
+                created.append(sock)
+                return sock
+
+            rtts, sent = probe_udp_relay(
+                "155.133.226.68",
+                27019,
+                socket_factory=factory,
+                sleep_fn=lambda _s: None,
+                clock=clock,
+            )
+            self.assertEqual(len(created), 1)
+            self.assertTrue(created[0].closed)
+            return rtts, sent, created[0]
+
+        # (a) Cold handshake on P0 + warm RTT on P1
+        rtts_a, sent_a, sock_a = run_case([180.0, 56.0])
+        self.assertEqual([round(x, 1) for x in rtts_a], [180.0, 56.0])
+        self.assertEqual(sent_a, 2)
+        self.assertEqual(len(sock_a.sent_calls), 2)
+        self.assertTrue(all(pkt.startswith(b"\x00") and len(pkt) == 32 for pkt, _ in sock_a.sent_calls))
+        self.assertTrue(all(addr == ("155.133.226.68", 27019) for _, addr in sock_a.sent_calls))
+
+        # (b) P0 succeeds + P1 times out -> 50% loss
+        rtts_b, sent_b, sock_b = run_case([180.0, None])
+        self.assertEqual([round(x, 1) for x in rtts_b], [180.0])
+        self.assertEqual(sent_b, 2)
+        self.assertEqual(len(sock_b.sent_calls), 2)
+
+        # (c) Cold P0 drop + P1 & P2 succeed -> steady-state 0% loss, max 2 Valve replies
+        rtts_c, sent_c, sock_c = run_case([None, 56.0, 57.0])
+        self.assertEqual([round(x, 1) for x in rtts_c], [56.0, 57.0])
+        self.assertEqual(sent_c, 2)
+        self.assertEqual(len(sock_c.sent_calls), 3)
+
+        # (d) P0 drop + P1 ok + P2 drop -> 50% loss
+        rtts_d, sent_d, sock_d = run_case([None, 56.0, None])
+        self.assertEqual([round(x, 1) for x in rtts_d], [56.0])
+        self.assertEqual(sent_d, 2)
+        self.assertEqual(len(sock_d.sent_calls), 3)
+
+        # (e) P0 + P1 drop -> empty/dead and never sends P2
+        rtts_e, sent_e, sock_e = run_case([None, None, 56.0])
+        self.assertEqual(rtts_e, [])
+        self.assertEqual(sent_e, 2)
+        self.assertEqual(len(sock_e.sent_calls), 2)
+
+    def test_probe_server_udp_aggregation_and_early_stop(self) -> None:
+        calls: list[tuple[str, int]] = []
+        responses = {
+            ("155.133.248.36", 27015): ([], 2),
+            ("155.133.248.37", 27020): ([184.0, 62.0], 2),
+            ("155.133.248.40", 27015): ([61.0], 2),
+            ("155.133.248.41", 27015): ([59.0, 59.0], 2),
+        }
+
+        def fake_relay(ip: str, port: int) -> tuple[list[float], int]:
+            calls.append((ip, port))
+            return responses[(ip, port)]
+
+        res = probe_server_udp(
+            ["155.133.248.36", "155.133.248.37", "155.133.248.40", "155.133.248.41"],
+            relay_ports={"155.133.248.37": 27020},
+            relay_prober=fake_relay,
+        )
+        # Skips dead .36, stops after 2 responsive relays (.37 and .40), never probes .41
+        self.assertEqual(
+            calls,
+            [("155.133.248.36", 27015), ("155.133.248.37", 27020), ("155.133.248.40", 27015)],
+        )
+        self.assertEqual(res, {"ping_ms": 61, "loss": 25, "ip": "155.133.248.40"})
+
+        # Early stop after 3 consecutive dead relays when blocked
+        dead_calls: list[str] = []
+
+        def all_dead(ip: str, _port: int) -> tuple[list[float], int]:
+            dead_calls.append(ip)
+            return [], 2
+
+        dead_res = probe_server_udp(
+            ["1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4"],
+            relay_prober=all_dead,
+        )
+        self.assertEqual(dead_calls, ["1.1.1.1", "2.2.2.2", "3.3.3.3"])
+        self.assertEqual(dead_res, {"ping_ms": None, "loss": 100, "ip": None})
+
+    def test_probe_server_fallback_and_fake_tun_rejection(self) -> None:
+        icmp_calls: list[list[str]] = []
+
+        def real_icmp_runner(cmd: list[str], **_kwargs) -> subprocess.CompletedProcess[str]:
+            icmp_calls.append(cmd)
+            out = (
+                "2 packets transmitted, 2 received, 0% packet loss, time 201ms\n"
+                "rtt min/avg/max/mdev = 66.2/66.5/66.8/0.3 ms\n"
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+        # (a) UDP success skips ICMP fallback
+        res_udp = probe_server(
+            ["155.133.226.68"],
+            runner=real_icmp_runner,
+            platform="linux",
+            udp_prober=lambda _ips, relay_ports=None: {"ping_ms": 56, "loss": 0, "ip": "155.133.226.68"},
+        )
+        self.assertEqual(res_udp, {"ping_ms": 56, "loss": 0, "ip": "155.133.226.68"})
+        self.assertEqual(icmp_calls, [])
+
+        # (b) UDP failure falls back to real ICMP
+        res_icmp = probe_server(
+            ["212.102.63.139"],
+            runner=real_icmp_runner,
+            platform="linux",
+            udp_prober=lambda _ips, relay_ports=None: {"ping_ms": None, "loss": 100, "ip": None},
+        )
+        self.assertEqual(res_icmp, {"ping_ms": 66, "loss": 0, "ip": "212.102.63.139"})
+        self.assertEqual(len(icmp_calls), 1)
+
+        # (c) UDP failure + fake TUN ICMP echo (<1ms) is rejected
+        def fake_tun_runner(cmd: list[str], **_kwargs) -> subprocess.CompletedProcess[str]:
+            out = (
+                "2 packets transmitted, 2 received, 0% packet loss, time 1001ms\n"
+                "rtt min/avg/max/mdev = 0.063/0.846/1.630/0.783 ms\n"
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+        res_fake = probe_server(
+            ["212.102.63.139"],
+            runner=fake_tun_runner,
+            platform="linux",
+            udp_prober=lambda _ips, relay_ports=None: {"ping_ms": None, "loss": 100, "ip": None},
+        )
+        self.assertEqual(res_fake, {"ping_ms": None, "loss": 100, "ip": None})
+
+    def test_ping_manager_passes_relay_ports_and_supports_legacy_prober(self) -> None:
+        def wait_done(mgr: PingManager) -> dict[str, dict[str, object]]:
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                snap, running = mgr.get_snapshot()
+                if not running:
+                    return snap
+                time.sleep(0.01)
+            self.fail("PingManager did not complete within timeout")
+
+        received: list[tuple[list[str], dict[str, int] | None]] = []
+
+        def port_aware_prober(ips: list[str], relay_ports: dict[str, int] | None = None) -> dict[str, object]:
+            received.append((list(ips), relay_ports))
+            return {"ping_ms": 58, "loss": 0, "ip": ips[0]}
+
+        mgr = PingManager(max_workers=2, prober=port_aware_prober)
+        try:
+            mgr.refresh_all(
+                [{"id": "ams", "ips": ["155.133.248.36"], "relay_ports": {"155.133.248.36": 27022}}]
+            )
+            snap = wait_done(mgr)
+            self.assertEqual(snap["ams"], {"ping_ms": 58, "loss": 0, "probing": False})
+            mgr.probe_single("ams", ["155.133.248.37"], relay_ports={"155.133.248.37": 27025})
+            wait_done(mgr)
+            self.assertEqual(
+                received,
+                [
+                    (["155.133.248.36"], {"155.133.248.36": 27022}),
+                    (["155.133.248.37"], {"155.133.248.37": 27025}),
+                ],
+            )
+        finally:
+            mgr.shutdown()
+
+        # Legacy 1-arg prober still works cleanly
+        legacy_mgr = PingManager(
+            max_workers=2,
+            prober=lambda ips: {"ping_ms": 44, "loss": 0, "ip": ips[0]},
+        )
+        try:
+            legacy_mgr.refresh_all(
+                [{"id": "fra", "ips": ["155.133.226.68"], "relay_ports": {"155.133.226.68": 27015}}]
+            )
+            legacy_snap = wait_done(legacy_mgr)
+            self.assertEqual(legacy_snap["fra"], {"ping_ms": 44, "loss": 0, "probing": False})
+        finally:
+            legacy_mgr.shutdown()
+
     def test_config_dir_and_presets_persistence(self) -> None:
         self.assertEqual(get_config_dir().name, "deadlock-server-blocker")
         with tempfile.TemporaryDirectory() as tmp:
@@ -413,8 +735,9 @@ class TestBackendHTTP(unittest.TestCase):
                 icon_bytes = urllib.request.urlopen(f"{base}/icon.png").read()
                 self.assertTrue(icon_bytes.startswith(b"\x89PNG"))
 
-                # State endpoint works and includes region group and platform
+                # State endpoint works and includes version, region group, and platform
                 state = json.loads(urllib.request.urlopen(f"{base}/api/state").read().decode("utf-8"))
+                self.assertEqual(state["version"], VERSION)
                 self.assertEqual(len(state["servers"]), 3)
                 self.assertTrue(state["sudo_ready"])
                 self.assertIn(state["platform"], ("linux", "windows"))

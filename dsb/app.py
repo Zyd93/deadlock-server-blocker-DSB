@@ -22,7 +22,7 @@ BUNDLE_ROOT = Path(getattr(sys, "_MEIPASS", PROJECT_ROOT))
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from dsb import APP_NAME  # noqa: E402
+from dsb import APP_NAME, VERSION  # noqa: E402
 from dsb.config import ConfigStore  # noqa: E402
 from dsb.firewall import (  # noqa: E402
     FirewallError,
@@ -120,6 +120,7 @@ class DSBBackend:
             )
 
         return {
+            "version": VERSION,
             "servers": servers_out,
             "clustered": self.config.clustered,
             "presets": sorted(self.config.presets.keys()),
@@ -146,7 +147,9 @@ class DSBBackend:
 
             self.config.active_preset = None
             self.config.save()
-            self.ping_manager.probe_single(target["id"], ips)
+            self.ping_manager.probe_single(
+                target["id"], ips, relay_ports=target.get("relay_ports")
+            )
             return self.get_state()
 
     def bulk_set(self, server_ids: list[str], blocked: bool) -> dict[str, Any]:
@@ -176,7 +179,11 @@ class DSBBackend:
                 self.ping_manager.refresh_all(targets)
             else:
                 for srv in targets:
-                    self.ping_manager.probe_single(srv["id"], srv.get("ips", []))
+                    self.ping_manager.probe_single(
+                        srv["id"],
+                        srv.get("ips", []),
+                        relay_ports=srv.get("relay_ports"),
+                    )
             return self.get_state()
 
     def block_all(self) -> dict[str, Any]:

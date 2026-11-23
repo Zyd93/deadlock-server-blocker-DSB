@@ -2,4 +2,4 @@
 
 APP_NAME = "Deadlock Server Blocker - DSB"
 SHORT_NAME = "DSB"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
