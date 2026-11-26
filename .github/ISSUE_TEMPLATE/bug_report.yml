@@ -1,0 +1,55 @@
+name: Bug report
+description: Something doesn't work as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for reporting! Please fill in as much as you can.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1.
+        2.
+        3.
+  - type: input
+    id: version
+    attributes:
+      label: DSB version
+      description: Shown in Releases, or `dsb/__init__.py` (e.g. 1.1.1)
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - Windows 10
+        - Windows 11
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Linux distribution (if Linux)
+      placeholder: e.g. CachyOS, Ubuntu 24.04, Fedora 41
+  - type: input
+    id: firewall
+    attributes:
+      label: Firewall setup (Linux)
+      description: e.g. plain iptables, UFW, firewalld, nftables
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / error output
+      description: Error text from the app, or terminal output from `scripts/dsb-gui`.
+      render: shell

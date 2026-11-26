@@ -60,6 +60,18 @@ cd deadlock-server-blocker-DSB
 
 ---
 
+## Troubleshooting
+
+- **Red "sudo expired" warning / "blocked status unknown":** DSB can't read the firewall because its `sudo` session ended. Close and reopen DSB to re-authenticate. While this warning is shown, server tiles may look unblocked even if rules are still active, and saving presets is disabled.
+- **Blocks are gone after a reboot:** This is expected. DSB's rules are not saved to disk, so reopen DSB and re-apply your preset after restarting.
+- **Errors about a missing `iptables` on Debian / Ubuntu:** Install the `iptables` package. DSB looks in `/usr/sbin` and `/sbin` as well as your `PATH`.
+- **firewalld users:** Reloading firewalld can drop DSB's rules. Re-apply your preset afterwards.
+- **IPv6:** DSB only blocks IPv4 relay addresses.
+- **No ping shown for a region:** The relay didn't answer DSB's UDP probe or ICMP ping. Behind a VPN / TUN proxy, DSB deliberately ignores fake sub-1 ms replies that the proxy answers locally.
+- **Remove everything DSB added:** Use **Reset Firewall** in the app. It deletes only DSB's own `DSB_BLOCK` chain and never touches UFW or other rules.
+
+---
+
 ## Tests
 
 ```bash
