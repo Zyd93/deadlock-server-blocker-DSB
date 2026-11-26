@@ -1,6 +1,18 @@
 #!/bin/bash
 set -u
 
+# sudo lives in /usr/bin, but iptables-era tools may sit in /usr/sbin or /sbin
+export PATH="$PATH:/usr/sbin:/sbin:/usr/bin:/bin"
+find_bin() {
+    local found
+    found=$(command -v "$1" 2>/dev/null) && [[ -n "$found" ]] && { printf '%s\n' "$found"; return; }
+    printf '%s\n' "$2"
+}
+SUDO_BIN=$(find_bin sudo /usr/bin/sudo)
+SCRIPT_BIN=$(find_bin script /usr/bin/script)
+# Prefer the system interpreter: it has the GTK/WebKit bindings, a venv/pyenv python may not.
+if [[ -x /usr/bin/python3 ]]; then PYTHON_BIN=/usr/bin/python3; else PYTHON_BIN=$(find_bin python3 python3); fi
+
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -10,7 +22,7 @@ if [[ "${DSB_IN_PTY:-}" != "1" ]]; then
     export DSB_IN_PTY=1
     export SHELL=/bin/bash
     printf -v quoted_script '%q' "$SCRIPT_PATH"
-    exec /usr/bin/script -qec "$quoted_script" /dev/null </dev/null
+    exec "$SCRIPT_BIN" -qec "$quoted_script" /dev/null </dev/null
 fi
 
 prompt_password() {
@@ -73,10 +85,15 @@ fi
 
 runtime_dir="/run/user/$(id -u)"
 if [[ ! -d "$runtime_dir" ]]; then
-    runtime_dir="${XDG_RUNTIME_DIR:-/tmp}"
+    runtime_dir="${XDG_RUNTIME_DIR:-}"
+fi
+if [[ -z "$runtime_dir" || ! -d "$runtime_dir" || ! -w "$runtime_dir" ]]; then
+    show_error "No private runtime directory (/run/user/$(id -u) or XDG_RUNTIME_DIR) is available, so Deadlock Server Blocker - DSB was not started."
+    exit 1
 fi
 
-pass_file="$runtime_dir/dsb-pass-$(id -u)"
+umask 077
+pass_file=$(mktemp "$runtime_dir/dsb-pass-$(id -u).XXXXXX")
 err_file=$(mktemp "$runtime_dir/dsb-err-$(id -u).XXXXXX")
 keepalive_pid=""
 
@@ -85,19 +102,19 @@ cleanup() {
         kill "$keepalive_pid" 2>/dev/null || true
     fi
     rm -f "$pass_file" "$err_file"
-    /usr/bin/sudo -k 2>/dev/null || true
+    "$SUDO_BIN" -k 2>/dev/null || true
 }
 trap cleanup EXIT
 
 (
     umask 077
-    rm -f "$pass_file"
     printf '%s\n' "$pass" > "$pass_file"
 )
 unset pass
 
 export SUDO_ASKPASS="${SCRIPT_DIR}/dsb-askpass"
-if ! /usr/bin/sudo -A -v 2>"$err_file"; then
+export DSB_PASS_FILE="$pass_file"
+if ! "$SUDO_BIN" -A -v 2>"$err_file"; then
     err_msg=$(cat "$err_file")
     rm -f "$pass_file" "$err_file"
     if [[ "$err_msg" == *"no password was provided"* ]]; then
@@ -116,9 +133,10 @@ rm -f "$pass_file" "$err_file"
         sleep 60 &
         sleep_pid=$!
         wait "$sleep_pid" || break
-        /usr/bin/sudo -n -v 2>/dev/null || break
+        # Keep retrying quietly; the UI reports an expired sudo ticket itself
+        "$SUDO_BIN" -n -v 2>/dev/null || true
     done
 ) </dev/null >/dev/null 2>&1 &
 keepalive_pid=$!
 
-/usr/bin/python3 "${PROJECT_DIR}/dsb/app.py"
+"$PYTHON_BIN" "${PROJECT_DIR}/dsb/app.py"

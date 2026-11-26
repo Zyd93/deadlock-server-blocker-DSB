@@ -9,10 +9,12 @@ import subprocess
 import sys
 from typing import Callable, Iterable
 
+from dsb import find_binary
+
 CHAIN_NAME = "DSB_BLOCK"
-_SUDO_BIN = "/usr/bin/sudo"
-_IPTABLES_BIN = "/usr/bin/iptables"
-_IPTABLES_RESTORE_BIN = "/usr/bin/iptables-restore"
+_SUDO_BIN = find_binary("sudo", "/usr/bin/sudo")
+_IPTABLES_BIN = find_binary("iptables", "/usr/bin/iptables")
+_IPTABLES_RESTORE_BIN = find_binary("iptables-restore", "/usr/bin/iptables-restore")
 _BATCH_SIZE = 40
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -63,16 +65,25 @@ class FirewallManager:
 
     def _run_iptables(self, args: list[str]) -> subprocess.CompletedProcess[str]:
         cmd = [_SUDO_BIN, "-n", _IPTABLES_BIN, "-w", "5", *args]
-        return self._runner(cmd, capture_output=True, text=True, check=False)
+        try:
+            return self._runner(cmd, capture_output=True, text=True, check=False)
+        except OSError as exc:
+            raise FirewallError(f"Cannot run {_SUDO_BIN}/{_IPTABLES_BIN}: {exc}") from exc
 
     def _run_iptables_restore(self, rules: str) -> subprocess.CompletedProcess[str]:
         """Apply an iptables-restore script; with --noflush only chains it names change."""
         cmd = [_SUDO_BIN, "-n", _IPTABLES_RESTORE_BIN, "-w", "5", "--noflush"]
-        return self._runner(cmd, input=rules, capture_output=True, text=True, check=False)
+        try:
+            return self._runner(cmd, input=rules, capture_output=True, text=True, check=False)
+        except OSError as exc:
+            raise FirewallError(f"Cannot run {_SUDO_BIN}/{_IPTABLES_RESTORE_BIN}: {exc}") from exc
 
     def check_sudo(self) -> bool:
         """Return True if non-interactive sudo credentials are currently valid."""
-        res = self._runner([_SUDO_BIN, "-n", "-v"], capture_output=True, text=True, check=False)
+        try:
+            res = self._runner([_SUDO_BIN, "-n", "-v"], capture_output=True, text=True, check=False)
+        except OSError as exc:
+            raise FirewallError(f"Cannot run {_SUDO_BIN}: {exc}") from exc
         return res.returncode == 0
 
     def ensure_chain(self) -> None:
@@ -115,11 +126,9 @@ class FirewallManager:
             stderr = res.stderr.strip()
             if "no chain/target/match by that name" in stderr.lower():
                 return set()
-            if not strict and _is_sudo_auth_error(stderr):
+            if not strict:
                 return set()
-            if strict:
-                raise FirewallError(stderr or f"Failed to query {CHAIN_NAME}")
-            return set()
+            raise FirewallError(stderr or f"Failed to query {CHAIN_NAME}")
 
         blocked: set[str] = set()
         for line in res.stdout.splitlines():
@@ -142,7 +151,7 @@ class FirewallManager:
         """Ensure target IPs are blocked in DSB_BLOCK without duplicating existing rules."""
         target = set(_validate_ipv4_list(ips))
         if not target:
-            return self.get_blocked_ips()
+            return self.get_blocked_ips(strict=True)
         self.ensure_chain()
         current = self.get_blocked_ips(strict=True)
         missing = sorted(target - current)
@@ -154,15 +163,15 @@ class FirewallManager:
         """Remove target IPs from DSB_BLOCK if currently present."""
         target = set(_validate_ipv4_list(ips))
         if not target:
-            return self.get_blocked_ips()
-        current = self.get_blocked_ips()
+            return self.get_blocked_ips(strict=True)
+        current = self.get_blocked_ips(strict=True)
         to_remove = sorted(current & target)
         for ip in to_remove:
             for _ in range(16):
                 res = self._run_iptables(["-D", CHAIN_NAME, "-s", ip, "-j", "DROP"])
                 if res.returncode != 0:
                     break
-        return self.get_blocked_ips()
+        return self.get_blocked_ips(strict=True)
 
     def set_blocked_ips(self, target_ips: Iterable[str]) -> set[str]:
         """Replace DSB_BLOCK rules with exactly target_ips without touching INPUT or UFW."""

@@ -9,6 +9,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from dsb import VERSION
 from dsb.config import get_config_dir
 
 DEADLOCK_APP_ID = 1422450
@@ -206,7 +207,7 @@ def fetch_deadlock_servers(
     target_cache = cache_path or DEFAULT_CACHE_PATH
     req = urllib.request.Request(
         SDR_URL,
-        headers={"User-Agent": "DeadlockServerBlocker-DSB/1.0"},
+        headers={"User-Agent": f"DeadlockServerBlocker-DSB/{VERSION}"},
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import hmac
 import json
 import os
 import secrets
@@ -95,8 +96,19 @@ class DSBBackend:
         return result
 
     def get_state(self) -> dict[str, Any]:
-        sudo_ready = self.firewall.check_sudo()
-        blocked_ips = self.firewall.get_blocked_ips() if sudo_ready else set()
+        sudo_ready = False
+        blocked_ips: set[str] = set()
+        blocked_known = False
+        blocked_error: str | None = None
+        try:
+            sudo_ready = self.firewall.check_sudo()
+            if sudo_ready:
+                blocked_ips = self.firewall.get_blocked_ips(strict=True)
+                blocked_known = True
+            else:
+                blocked_error = "Cannot read the firewall: sudo/administrator access is not available."
+        except FirewallError as exc:
+            blocked_error = str(exc)
         ping_map, ping_running = self.ping_manager.get_snapshot()
 
         servers_out: list[dict[str, Any]] = []
@@ -129,6 +141,8 @@ class DSBBackend:
             "from_cache": bool(self.sdr_data.get("from_cache", False)),
             "sdr_error": self.sdr_error,
             "sudo_ready": sudo_ready,
+            "blocked_known": blocked_known,
+            "blocked_error": blocked_error,
             "ping_running": ping_running,
             "platform": "windows" if sys.platform == "win32" else "linux",
         }
@@ -240,6 +254,11 @@ class DSBBackend:
     def save_preset(self, name: str) -> dict[str, Any]:
         with self._op_lock:
             state = self.get_state()
+            if not state["blocked_known"]:
+                raise FirewallError(
+                    state["blocked_error"]
+                    or "Cannot read the current firewall state, so the preset was not saved."
+                )
             blocked_ids = [s["id"] for s in state["servers"] if s["blocked"]]
             self.config.save_preset(name, self.config.clustered, blocked_ids)
             return self.get_state()
@@ -250,15 +269,18 @@ class DSBBackend:
             if preset is None:
                 raise ValueError(f"Unknown preset: {name}")
 
-            self.config.clustered = bool(preset.get("clustered", False))
+            clustered = bool(preset.get("clustered", False))
             blocked_set = set(preset.get("blocked_ids", []))
-            servers = self._active_servers()
+            key = "clustered" if clustered else "unclustered"
+            servers = list(self.sdr_data.get(key, []))
             target_ips: list[str] = []
             for srv in servers:
                 if srv["id"] in blocked_set:
                     target_ips.extend(srv.get("ips", []))
 
+            # Firewall first: if it fails, config stays untouched.
             self.firewall.set_blocked_ips(target_ips)
+            self.config.clustered = clustered
             self.config.active_preset = name
             self.config.save()
             if servers:
@@ -305,7 +327,21 @@ def make_handler(backend: DSBBackend):
                 raise ValueError("JSON body must be an object")
             return parsed
 
+        def _host_allowed(self) -> bool:
+            """Reject unexpected Host headers (DNS-rebinding defence)."""
+            port = self.server.server_address[1]
+            host = (self.headers.get("Host") or "").strip().lower()
+            return host in (f"127.0.0.1:{port}", f"localhost:{port}")
+
+        def _reject_bad_host(self) -> bool:
+            if self._host_allowed():
+                return False
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "Forbidden: invalid Host header"})
+            return True
+
         def do_GET(self) -> None:
+            if self._reject_bad_host():
+                return
             path = urlparse(self.path).path
             if path == "/":
                 html_path = backend.ui_dir / "index.html"
@@ -340,7 +376,10 @@ def make_handler(backend: DSBBackend):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
 
         def do_POST(self) -> None:
-            if self.headers.get("X-DSB-Token") != backend.api_token:
+            if self._reject_bad_host():
+                return
+            supplied = (self.headers.get("X-DSB-Token") or "").encode("utf-8", "replace")
+            if not hmac.compare_digest(supplied, backend.api_token.encode("utf-8")):
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": "Forbidden: invalid token"})
                 return
 

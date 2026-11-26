@@ -13,9 +13,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
+from dsb import find_binary
 from dsb.sdr import DEFAULT_SDR_PORT
 
-_LINUX_PING_BIN = "/usr/bin/ping"
+_LINUX_PING_BIN = find_binary("ping", "/usr/bin/ping")
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 _LINUX_LOSS_RE = re.compile(r"(\d+(?:\.\d+)?)%\s+packet loss")

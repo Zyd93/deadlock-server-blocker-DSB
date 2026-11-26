@@ -1,13 +1,9 @@
 #!/bin/bash
 set -u
 
-runtime_dir="/run/user/$(id -u)"
-if [[ ! -d "$runtime_dir" ]]; then
-    runtime_dir="${XDG_RUNTIME_DIR:-/tmp}"
-fi
-
-pass_file="$runtime_dir/dsb-pass-$(id -u)"
-if [[ -f "$pass_file" ]]; then
+# dsb-gui creates a private temp file and passes its path here
+pass_file="${DSB_PASS_FILE:-}"
+if [[ -n "$pass_file" && -f "$pass_file" && ! -L "$pass_file" ]]; then
     cat "$pass_file"
     rm -f "$pass_file"
     exit 0

@@ -18,6 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from dsb import VERSION  # noqa: E402
+from dsb import firewall as fw_mod  # noqa: E402
 from dsb.app import DSBBackend, start_http_server  # noqa: E402
 from dsb.config import ConfigStore, get_config_dir  # noqa: E402
 from dsb.firewall import (  # noqa: E402
@@ -50,7 +51,7 @@ class FakeIptables:
 
     def __call__(self, cmd: list[str], **_kwargs) -> subprocess.CompletedProcess[str]:
         self.calls.append(list(cmd))
-        if cmd[:3] == ["/usr/bin/sudo", "-n", "-v"]:
+        if cmd[1:3] == ["-n", "-v"]:
             return subprocess.CompletedProcess(
                 cmd, 0 if self.sudo_ok else 1, stdout="", stderr="" if self.sudo_ok else "sudo: a password is required\n"
             )
@@ -60,10 +61,10 @@ class FakeIptables:
                 cmd, 1, stdout="", stderr="sudo: a password is required\n"
             )
 
-        if cmd[:3] == ["/usr/bin/sudo", "-n", "/usr/bin/iptables-restore"]:
+        if cmd[:2] == [fw_mod._SUDO_BIN, "-n"] and cmd[2] == fw_mod._IPTABLES_RESTORE_BIN:
             return self._restore(cmd, _kwargs.get("input", ""))
 
-        # Strip ['/usr/bin/sudo', '-n', '/usr/bin/iptables', '-w', '5']
+        # Strip [sudo, '-n', iptables, '-w', '5']
         args = cmd[5:]
         op = args[0]
 
@@ -325,7 +326,7 @@ class TestFirewall(unittest.TestCase):
         self.assertEqual(fake.chains["INPUT"][0], f"-A INPUT -j {CHAIN_NAME}")
         # Done in one restore transaction, never via a separate flush.
         self.assertFalse(any(c[5:6] == ["-F"] for c in fake.calls))
-        self.assertEqual(sum(1 for c in fake.calls if "/usr/bin/iptables-restore" in c), 1)
+        self.assertEqual(sum(1 for c in fake.calls if fw_mod._IPTABLES_RESTORE_BIN in c), 1)
 
         # A failure mid-way leaves the previous block list fully intact.
         fake.fail_restore_on = "10.9.9.9"
@@ -336,6 +337,27 @@ class TestFirewall(unittest.TestCase):
         # Empty target clears the chain.
         fake.fail_restore_on = None
         self.assertEqual(fw.set_blocked_ips([]), set())
+
+    def test_unblock_requires_readable_firewall(self) -> None:
+        fake = FakeIptables()
+        fw = FirewallManager(runner=fake)
+        fw.block_ips(["155.133.226.68"])
+        fake.sudo_ok = False
+        with self.assertRaises(FirewallError):
+            fw.unblock_ips(["155.133.226.68"])
+        with self.assertRaises(FirewallError):
+            fw.get_blocked_ips(strict=True)
+        self.assertEqual(fake.chains[CHAIN_NAME], [f"-A {CHAIN_NAME} -s 155.133.226.68/32 -j DROP"])
+
+    def test_missing_binary_gives_firewall_error(self) -> None:
+        def missing(cmd, **_kw):
+            raise FileNotFoundError(2, "No such file or directory", cmd[0])
+
+        fw = FirewallManager(runner=missing)
+        with self.assertRaises(FirewallError):
+            fw.check_sudo()
+        with self.assertRaises(FirewallError):
+            fw.get_blocked_ips(strict=True)
 
     def test_invalid_ip_rejected(self) -> None:
         fw = FirewallManager(runner=FakeIptables())
@@ -864,6 +886,141 @@ class TestBackendHTTP(unittest.TestCase):
                 backend.shutdown()
                 httpd.shutdown()
                 httpd.server_close()
+
+
+SAMPLE_SDR = {
+    "revision": 99,
+    "pops": {
+        "fra": {"desc": "Frankfurt (Germany)", "relays": [{"ipv4": "155.133.226.68"}]},
+        "ams": {"desc": "Amsterdam (Netherlands)", "relays": [{"ipv4": "155.133.248.36"}]},
+    },
+}
+
+
+class TestBackendSafety(unittest.TestCase):
+    def _backend(self, tmp: str, fake: FakeIptables) -> DSBBackend:
+        mock_ping = MagicMock(spec=PingManager)
+        mock_ping.get_snapshot.return_value = ({}, False)
+        return DSBBackend(
+            firewall=FirewallManager(runner=fake),
+            ping_manager=mock_ping,
+            config_store=ConfigStore(Path(tmp) / "cfg.json"),
+            sdr_fetcher=lambda: parse_sdr_payload(SAMPLE_SDR) | {"from_cache": False},
+        )
+
+    def test_state_reports_unreadable_firewall(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = FakeIptables(sudo_ok=False)
+            state = self._backend(tmp, fake).get_state()
+            self.assertFalse(state["sudo_ready"])
+            self.assertFalse(state["blocked_known"])
+            self.assertTrue(state["blocked_error"])
+
+            # sudo check passes but the chain query fails
+            fake2 = FakeIptables()
+            backend = self._backend(tmp, fake2)
+            backend.firewall.get_blocked_ips = MagicMock(side_effect=FirewallError("boom"))
+            state = backend.get_state()
+            self.assertFalse(state["blocked_known"])
+            self.assertEqual(state["blocked_error"], "boom")
+
+            ok = self._backend(tmp, FakeIptables()).get_state()
+            self.assertTrue(ok["blocked_known"])
+            self.assertIsNone(ok["blocked_error"])
+
+    def test_save_preset_refused_when_unreadable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = FakeIptables()
+            backend = self._backend(tmp, fake)
+            fake.sudo_ok = False
+            with self.assertRaises(FirewallError):
+                backend.save_preset("Empty")
+            self.assertEqual(backend.config.presets, {})
+            self.assertIsNone(backend.config.active_preset)
+
+    def test_apply_preset_failure_leaves_config_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = FakeIptables()
+            backend = self._backend(tmp, fake)
+            backend.config.save_preset("P", True, ["cluster:eu"])
+            self.assertFalse(backend.config.clustered)
+            backend.config.active_preset = None
+            backend.firewall.set_blocked_ips = MagicMock(side_effect=FirewallError("nope"))
+            with self.assertRaises(FirewallError):
+                backend.apply_preset("P")
+            self.assertFalse(backend.config.clustered)
+            self.assertIsNone(backend.config.active_preset)
+
+    def test_apply_preset_success_updates_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            backend = self._backend(tmp, FakeIptables())
+            backend.config.save_preset("P", True, [])
+            backend.apply_preset("P")
+            self.assertTrue(backend.config.clustered)
+            self.assertEqual(backend.config.active_preset, "P")
+
+    def test_host_header_and_token_hardening(self) -> None:
+        import http.client
+
+        with tempfile.TemporaryDirectory() as tmp:
+            backend = self._backend(tmp, FakeIptables())
+            httpd, port = start_http_server(backend)
+            try:
+                def req(method, path, host, token=None):
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                    conn.putrequest(method, path, skip_host=True)
+                    conn.putheader("Host", host)
+                    conn.putheader("Content-Length", "2")
+                    if token is not None:
+                        conn.putheader("X-DSB-Token", token)
+                    conn.endheaders(b"{}")
+                    resp = conn.getresponse()
+                    body = resp.read()
+                    conn.close()
+                    return resp.status, body
+
+                for host in (f"127.0.0.1:{port}", f"localhost:{port}"):
+                    status, body = req("GET", "/", host)
+                    self.assertEqual(status, 200)
+                    self.assertIn(backend.api_token.encode(), body)
+                    self.assertEqual(req("GET", "/api/state", host)[0], 200)
+
+                for bad in ("evil.example.com", f"evil.example.com:{port}", "127.0.0.1", f"127.0.0.1:{port + 1}", ""):
+                    for path in ("/", "/api/state", "/icon.png"):
+                        status, body = req("GET", path, bad)
+                        self.assertEqual(status, 403, (bad, path))
+                        self.assertNotIn(backend.api_token.encode(), body)
+                    # Valid token is still rejected from a bad Host
+                    self.assertEqual(
+                        req("POST", "/api/refresh", bad, backend.api_token)[0], 403
+                    )
+
+                good = f"127.0.0.1:{port}"
+                self.assertEqual(req("POST", "/api/refresh", good, "wrong")[0], 403)
+                self.assertEqual(req("POST", "/api/refresh", good, "caf\u00e9")[0], 403)
+                self.assertEqual(req("POST", "/api/refresh", good, backend.api_token)[0], 200)
+            finally:
+                backend.shutdown()
+                httpd.shutdown()
+                httpd.server_close()
+
+    def test_user_agent_uses_real_version(self) -> None:
+        from unittest.mock import patch
+
+        seen = {}
+
+        def fake_urlopen(req, timeout=None):
+            seen["ua"] = req.get_header("User-agent")
+            raise OSError("offline")
+
+        from dsb.sdr import fetch_deadlock_servers
+
+        with tempfile.TemporaryDirectory() as tmp, patch("urllib.request.urlopen", fake_urlopen):
+            try:
+                fetch_deadlock_servers(cache_path=Path(tmp) / "c.json")
+            except Exception:
+                pass
+        self.assertEqual(seen["ua"], f"DeadlockServerBlocker-DSB/{VERSION}")
 
 
 if __name__ == "__main__":

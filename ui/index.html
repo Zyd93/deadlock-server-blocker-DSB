@@ -696,6 +696,8 @@
       from_cache: false,
       sdr_error: null,
       sudo_ready: true,
+      blocked_known: true,
+      blocked_error: null,
       ping_running: false,
       platform: "linux",
     };
@@ -845,7 +847,12 @@
 
     function renderStatus() {
       const isWin = appState.platform === "windows";
-      if (!appState.sudo_ready) {
+      if (appState.blocked_known === false) {
+        lastActionEl.textContent = (appState.blocked_error || "Cannot read firewall state")
+          + (isWin ? " — restart DSB as Administrator" : " — sudo expired? Re-authenticate by restarting DSB")
+          + ". Blocked status below is UNKNOWN.";
+        lastActionEl.className = "status-pill err";
+      } else if (!appState.sudo_ready) {
         lastActionEl.textContent = isWin
           ? "Run as Administrator to enable firewall packet blocking"
           : "Sudo not authenticated — launch via app menu for packet blocking";
@@ -1133,7 +1140,9 @@
       const onCount = scopeServers.filter(s => !s.blocked).length;
       const blockedCount = scopeServers.length - onCount;
       const scopePrefix = selectedRegion === "all" ? "All" : regionShortLabel(selectedRegion);
-      countsEl.textContent = allServers.length
+      countsEl.textContent = allServers.length && appState.blocked_known === false
+        ? `${scopePrefix}: blocked status unknown`
+        : allServers.length
         ? `${scopePrefix}: ${onCount} on · ${blockedCount} blocked`
         : "0 relays loaded";
 
