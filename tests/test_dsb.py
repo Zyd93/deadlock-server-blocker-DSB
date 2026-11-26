@@ -46,6 +46,7 @@ class FakeIptables:
             "INPUT": list(initial_input or ["-A INPUT -j ufw-before-input"]),
         }
         self.calls: list[list[str]] = []
+        self.fail_restore_on: str | None = None
 
     def __call__(self, cmd: list[str], **_kwargs) -> subprocess.CompletedProcess[str]:
         self.calls.append(list(cmd))
@@ -58,6 +59,9 @@ class FakeIptables:
             return subprocess.CompletedProcess(
                 cmd, 1, stdout="", stderr="sudo: a password is required\n"
             )
+
+        if cmd[:3] == ["/usr/bin/sudo", "-n", "/usr/bin/iptables-restore"]:
+            return self._restore(cmd, _kwargs.get("input", ""))
 
         # Strip ['/usr/bin/sudo', '-n', '/usr/bin/iptables', '-w', '5']
         args = cmd[5:]
@@ -127,6 +131,29 @@ class FakeIptables:
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
         raise AssertionError(f"Unexpected iptables args: {args}")
+
+    def _restore(self, cmd: list[str], script: str) -> subprocess.CompletedProcess[str]:
+        """Minimal all-or-nothing iptables-restore --noflush emulation."""
+        assert "--noflush" in cmd
+        staged = {k: list(v) for k, v in self.chains.items()}
+        for line in script.splitlines():
+            line = line.strip()
+            if not line or line in ("*filter", "COMMIT"):
+                continue
+            if line.startswith(":"):
+                staged[line[1:].split()[0]] = []
+                continue
+            parts = line.split()
+            if parts[0] == "-A" and parts[2] == "-s" and parts[4:] == ["-j", "DROP"]:
+                for ip in parts[3].split(","):
+                    if self.fail_restore_on == ip:
+                        return subprocess.CompletedProcess(
+                            cmd, 2, stdout="", stderr=f"host/network `{ip}' not found\n")
+                    staged[parts[1]].append(f"-A {parts[1]} -s {ip}/32 -j DROP")
+                continue
+            raise AssertionError(f"Unexpected restore line: {line}")
+        self.chains = staged
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
 
 class TestSDR(unittest.TestCase):
@@ -286,6 +313,29 @@ class TestFirewall(unittest.TestCase):
         self.assertNotIn("-A INPUT -s 155.133.246.34/32 -j DROP", fake.chains["INPUT"])
         # Ensure INPUT was never flushed directly
         self.assertFalse(any(c[5:] == ["-F", "INPUT"] for c in fake.calls))
+
+    def test_set_blocked_ips_replaces_atomically(self) -> None:
+        fake = FakeIptables()
+        fw = FirewallManager(runner=fake)
+        fw.block_ips(["155.133.226.68", "155.133.226.69"])
+
+        many = [f"10.0.{i // 256}.{i % 256}" for i in range(95)]  # spans 3 batches
+        blocked = fw.set_blocked_ips(["155.133.226.69", *many])
+        self.assertEqual(blocked, {"155.133.226.69", *many})
+        self.assertEqual(fake.chains["INPUT"][0], f"-A INPUT -j {CHAIN_NAME}")
+        # Done in one restore transaction, never via a separate flush.
+        self.assertFalse(any(c[5:6] == ["-F"] for c in fake.calls))
+        self.assertEqual(sum(1 for c in fake.calls if "/usr/bin/iptables-restore" in c), 1)
+
+        # A failure mid-way leaves the previous block list fully intact.
+        fake.fail_restore_on = "10.9.9.9"
+        with self.assertRaises(FirewallError):
+            fw.set_blocked_ips(["1.2.3.4", "10.9.9.9"])
+        self.assertEqual(fw.get_blocked_ips(strict=True), {"155.133.226.69", *many})
+
+        # Empty target clears the chain.
+        fake.fail_restore_on = None
+        self.assertEqual(fw.set_blocked_ips([]), set())
 
     def test_invalid_ip_rejected(self) -> None:
         fw = FirewallManager(runner=FakeIptables())

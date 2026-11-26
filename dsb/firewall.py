@@ -12,6 +12,7 @@ from typing import Callable, Iterable
 CHAIN_NAME = "DSB_BLOCK"
 _SUDO_BIN = "/usr/bin/sudo"
 _IPTABLES_BIN = "/usr/bin/iptables"
+_IPTABLES_RESTORE_BIN = "/usr/bin/iptables-restore"
 _BATCH_SIZE = 40
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -63,6 +64,11 @@ class FirewallManager:
     def _run_iptables(self, args: list[str]) -> subprocess.CompletedProcess[str]:
         cmd = [_SUDO_BIN, "-n", _IPTABLES_BIN, "-w", "5", *args]
         return self._runner(cmd, capture_output=True, text=True, check=False)
+
+    def _run_iptables_restore(self, rules: str) -> subprocess.CompletedProcess[str]:
+        """Apply an iptables-restore script; with --noflush only chains it names change."""
+        cmd = [_SUDO_BIN, "-n", _IPTABLES_RESTORE_BIN, "-w", "5", "--noflush"]
+        return self._runner(cmd, input=rules, capture_output=True, text=True, check=False)
 
     def check_sudo(self) -> bool:
         """Return True if non-interactive sudo credentials are currently valid."""
@@ -162,11 +168,17 @@ class FirewallManager:
         """Replace DSB_BLOCK rules with exactly target_ips without touching INPUT or UFW."""
         desired = _validate_ipv4_list(target_ips)
         self.ensure_chain()
-        flush_res = self._run_iptables(["-F", CHAIN_NAME])
-        if flush_res.returncode != 0:
-            raise FirewallError(flush_res.stderr.strip() or f"Failed to flush {CHAIN_NAME}")
-        if desired:
-            self._append_batched(desired)
+        # One iptables-restore transaction: the chain is emptied and refilled
+        # atomically, so relays are never briefly unblocked and a failure
+        # leaves the previous block list fully in place.
+        lines = ["*filter", f":{CHAIN_NAME} - [0:0]"]
+        for i in range(0, len(desired), _BATCH_SIZE):
+            batch = ",".join(desired[i : i + _BATCH_SIZE])
+            lines.append(f"-A {CHAIN_NAME} -s {batch} -j DROP")
+        lines.append("COMMIT")
+        res = self._run_iptables_restore("\n".join(lines) + "\n")
+        if res.returncode != 0:
+            raise FirewallError(res.stderr.strip() or f"Failed to replace {CHAIN_NAME} rules")
         return self.get_blocked_ips(strict=True)
 
     def reset_firewall(self, known_deadlock_ips: Iterable[str] | None = None) -> set[str]:
